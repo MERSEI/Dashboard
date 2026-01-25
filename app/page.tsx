@@ -1,25 +1,25 @@
 import React, { Suspense } from "react";
-import { getProfitLoss } from "../../app/actions"; // Только один вызов!
+import { getWalletBalance, getProfitLoss } from "./actions";
 import DashboardClient from "@/components/DashboardClient";
 
 async function getDashboardData() {
   const publicKey = process.env.NEXT_PUBLIC_WALLET_ADDRESS;
 
   if (!publicKey || publicKey.includes("your")) {
-    throw new Error("NEXT_PUBLIC_WALLET_ADDRESS not configured");
+    throw new Error("NEXT_PUBLIC_WALLET_ADDRESS not configured in .env.local");
   }
 
-  // Один вызов вместо двух — getProfitLoss уже вызывает getWalletBalance внутри
-  const profitData = await getProfitLoss(publicKey);
+  const [walletData, profitData] = await Promise.all([
+    getWalletBalance(publicKey),
+    getProfitLoss(publicKey),
+  ]);
 
   return {
-    balance: profitData.chartData[profitData.chartData.length - 1]?.value || 0, // Последнее значение графика
+    balance: parseFloat(walletData.tokenBalance),
     profit: profitData.profit,
     profitPercent: profitData.profitPercent,
-    portfolioValue:
-      profitData.chartData[profitData.chartData.length - 1]?.value || 0,
-    usdcValue:
-      profitData.chartData[profitData.chartData.length - 1]?.value || 0,
+    portfolioValue: parseFloat(walletData.portfolioValue),
+    usdcValue: parseFloat(walletData.tokenBalance),
     chartData: profitData.chartData,
     publicKey,
   };
@@ -55,15 +55,9 @@ export default async function HomePage() {
             Configuration Error
           </h1>
           <p className="text-gray-600 mb-4">{error.message}</p>
-          <pre className="text-xs text-left bg-gray-100 p-4 rounded overflow-auto">
-            {`Required .env variables:
-            
-NEXT_PUBLIC_WALLET_ADDRESS=0x...
-RPC_URL=https://...
-ETHERSCAN_API_KEY=...
-TOKEN_CONTRACT_ADDRESS=0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48
-WALLET_PRIVATE_KEY=0x... (only for deposits/withdrawals)`}
-          </pre>
+          <p className="text-sm text-gray-500">
+            Please configure your .env.local file with valid API keys.
+          </p>
         </div>
       </div>
     );
