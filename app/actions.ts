@@ -1,662 +1,414 @@
 'use server'
 
+/**
+ * Server Actions.
+ *
+ * SECURITY NOTE, because it governs everything below: each exported function here
+ * is a public HTTP endpoint. Next.js compiles a Server Action into a POST route
+ * addressed by an id that ships in the client bundle, so any caller can invoke any
+ * exported action with arguments of their choosing. The UI is not an access
+ * control boundary.
+ *
+ * Therefore:
+ *   - every write action calls requireSession() before touching a key;
+ *   - every write action is rate limited per client;
+ *   - withdrawals may only target an address on the configured allowlist;
+ *   - read actions are rate limited too, to protect the upstream API keys.
+ */
+
+import { cookies, headers } from 'next/headers'
 import { ethers } from 'ethers'
-import axios from 'axios'
+import { readConfig, isProduction } from '@/lib/config'
+import {
+  SESSION_COOKIE,
+  createSessionToken,
+  verifySessionToken,
+  readAuthConfig,
+  safeEqual,
+  sessionCookieOptions,
+} from '@/lib/auth'
+import { rateLimit, resetRateLimit, clientKey, LIMITS } from '@/lib/ratelimit'
+import { logger, PublicError, publicErrorMessage } from '@/lib/logger'
+import { isValidAddress, normalizeAddress, isSameAddress } from '@/lib/address'
+import { toBaseUnits, fromBaseUnits, AmountError } from '@/lib/money'
+import {
+  fetchEthTransactions,
+  fetchTokenTransactions,
+  EtherscanError,
+} from '@/lib/etherscan'
+import {
+  normalizeTransfer,
+  sortTransfers,
+  computeFlows,
+  computePerformance,
+  buildBalanceSeries,
+  type Transfer,
+  type Period,
+} from '@/lib/portfolio'
 
-const CACHE_DURATION = 60000 // 1 minute
+const ERC20_ABI = [
+  'function balanceOf(address) view returns (uint256)',
+  'function decimals() view returns (uint8)',
+  'function symbol() view returns (string)',
+  'function transfer(address to, uint256 amount) returns (bool)',
+]
 
-interface CacheEntry<T> {
-  data: T
-  timestamp: number
-}
+// ─── Session ─────────────────────────────────────────────────────────────────
 
-const cache = new Map<string, CacheEntry<any>>()
+export type LoginResult = { ok: true } | { ok: false; error: string; retryAfterMs?: number }
 
-// Логгер
-const logger = {
-  info: (msg: string, data?: any) => console.log(`[INFO] ${new Date().toISOString()} - ${msg}`, data || ''),
-  error: (msg: string, error?: any) => console.error(`[ERROR] ${new Date().toISOString()} - ${msg}`, error),
-  warn: (msg: string, data?: any) => console.warn(`[WARN] ${new Date().toISOString()} - ${msg}`, data || ''),
-  debug: (msg: string, data?: any) => console.debug(`[DEBUG] ${new Date().toISOString()} - ${msg}`, data || ''),
-}
-
-function getCachedData<T>(key: string): T | null {
-  const cached = cache.get(key)
-  if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
-    logger.debug(`Cache HIT for key: ${key}`)
-    return cached.data
-  }
-  logger.debug(`Cache MISS for key: ${key}`)
-  cache.delete(key)
-  return null
-}
-
-function setCachedData<T>(key: string, data: T): void {
-  logger.debug(`Cache SET for key: ${key}`)
-  cache.set(key, { data, timestamp: Date.now() })
-}
-
-// ==================== TYPES ====================
-
-export interface WalletData {
-  balance: string
-  portfolioValue: string
-  profit: string
-  profitPercent: number
-  tokenBalance: string
-  transactions: Transaction[]
-  ethPrice: number
-}
-
-export interface Transaction {
-  hash: string
-  from: string
-  to: string
-  value: string
-  timestamp: number
-  type: 'deposit' | 'withdraw'
-  tokenValue: string
-  asset: 'ETH' | 'TOKEN'
-}
-
-export interface ChartDataPoint {
-  value: number
-  timestamp: number
-}
-
-export interface ProfitLossData {
-  profit: number
-  profitPercent: number
-  chartData: ChartDataPoint[]
-}
-
-// ==================== HELPERS ====================
-
-async function getEthPrice(): Promise<number> {
-  const cached = getCachedData<number>('eth_price')
-  if (cached) {
-    logger.info('Using cached ETH price', { price: cached })
-    return cached
-  }
-
-  logger.info('Fetching ETH price from CoinGecko...')
-  
-  try {
-    const response = await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd', {
-      timeout: 5000
-    })
-    const price = response.data.ethereum.usd
-    logger.info('ETH price fetched successfully', { price })
-    setCachedData('eth_price', price)
-    return price
-  } catch (error: any) {
-    logger.error('Failed to fetch ETH price, using fallback', { 
-      error: error.message,
-      status: error.response?.status 
-    })
-    return 3000 // fallback
-  }
-}
-
-function getTokenContract(providerOrSigner: ethers.JsonRpcProvider | ethers.Wallet) {
-  const address = process.env.TOKEN_CONTRACT_ADDRESS
-  logger.debug('Getting token contract', { address })
-
-  if (!address || address.includes('your')) {
-    logger.error('TOKEN_CONTRACT_ADDRESS not configured', { address })
-    throw new Error('TOKEN_CONTRACT_ADDRESS not configured')
-  }
-
-  const abi = [
-    'function balanceOf(address) view returns (uint256)',
-    'function decimals() view returns (uint8)',
-    'function transfer(address to, uint256 amount) returns (bool)',
-    'function approve(address spender, uint256 amount) returns (bool)',
-    'function symbol() view returns (string)'
-  ]
-
-  return new ethers.Contract(address, abi, providerOrSigner)
-}
-
-// ==================== MAIN FUNCTIONS ====================
-
-export async function getWalletBalance(publicKey: string): Promise<WalletData> {
-  const cacheKey = `balance_${publicKey}_${process.env.NEXT_PUBLIC_CHAIN_ID}`
-  logger.info('getWalletBalance called', { publicKey, cacheKey })
-
-  const cached = getCachedData<WalletData>(cacheKey)
-  if (cached) {
-    logger.info('Returning cached wallet data')
-    return cached
-  }
-
-  // Validate address
-  if (!publicKey || !publicKey.startsWith('0x') || publicKey.length !== 42) {
-    logger.error('Invalid Ethereum address', { publicKey, length: publicKey?.length })
-    throw new Error('Invalid Ethereum address')
-  }
-
-  // Check RPC
-  if (!process.env.RPC_URL || process.env.RPC_URL.includes('your')) {
-    logger.error('RPC_URL not configured')
-    throw new Error('RPC_URL not configured in .env.local')
-  }
-
-  logger.info('Connecting to RPC', { rpcUrl: process.env.RPC_URL?.replace(/\/v2\/.*/, '/v2/***') })
-
-  try {
-    const provider = new ethers.JsonRpcProvider(process.env.RPC_URL)
-    
-    // Test connection
-    const network = await provider.getNetwork()
-    logger.info('Connected to network', { 
-      chainId: network.chainId.toString(),
-      name: network.name 
-    })
-
-    // Get ETH balance
-    logger.debug('Fetching ETH balance...')
-    const ethBalance = await provider.getBalance(publicKey)
-    const ethBalanceFormatted = ethers.formatEther(ethBalance)
-    logger.info('ETH balance fetched', { balance: ethBalanceFormatted })
-
-    // Get token balance
-    let tokenBalance = '0'
-    let tokenDecimals = 6
-    let tokenSymbol = 'USDC'
-    
-    try {
-      logger.debug('Fetching token balance...')
-      const tokenContract = getTokenContract(provider)
-      const [balance, decimals, symbol] = await Promise.all([
-        tokenContract.balanceOf(publicKey),
-        tokenContract.decimals(),
-        tokenContract.symbol()
-      ])
-      tokenBalance = ethers.formatUnits(balance, decimals)
-      tokenDecimals = decimals
-      tokenSymbol = symbol
-      logger.info('Token balance fetched', { 
-        balance: tokenBalance, 
-        symbol: tokenSymbol,
-        decimals: tokenDecimals 
-      })
-    } catch (e: any) {
-      logger.warn('Token balance fetch failed', { error: e.message })
+/**
+ * Exchange the dashboard password for a session cookie.
+ *
+ * Rate limited per client so the endpoint cannot be used to guess the password,
+ * and the comparison is constant-time so it cannot be used as an oracle.
+ */
+export async function login(password: string): Promise<LoginResult> {
+  const key = `login:${clientKey(headers())}`
+  const limit = rateLimit(key, LIMITS.login.limit, LIMITS.login.windowMs)
+  if (!limit.allowed) {
+    logger.warn('Login rate limit exceeded')
+    return {
+      ok: false,
+      error: 'Too many attempts. Try again later.',
+      retryAfterMs: limit.resetAt - Date.now(),
     }
+  }
 
-    // Get ETH price
-    const ethPrice = await getEthPrice()
+  const auth = readAuthConfig()
+  if (!auth.ok) {
+    logger.error('Auth is not configured', new Error(auth.reason))
+    return { ok: false, error: 'Authentication is not configured on the server.' }
+  }
 
-    // Calculate portfolio value
-    const ethValueUsd = parseFloat(ethBalanceFormatted) * ethPrice
-    const tokenValueUsd = parseFloat(tokenBalance)
-    const portfolioValue = (ethValueUsd + tokenValueUsd).toFixed(2)
-    
-    logger.info('Portfolio value calculated', { 
-      ethValue: ethValueUsd.toFixed(2),
-      tokenValue: tokenValueUsd.toFixed(2),
-      total: portfolioValue 
-    })
+  if (typeof password !== 'string' || !safeEqual(password, auth.password)) {
+    logger.warn('Failed login attempt')
+    return { ok: false, error: 'Incorrect password.' }
+  }
 
-    // Get transaction history
-    logger.debug('Fetching transaction history...')
-    const transactions = await getTransactionHistory(publicKey, tokenDecimals)
-    logger.info('Transactions fetched', { count: transactions.length })
+  cookies().set(
+    SESSION_COOKIE,
+    createSessionToken(auth.secret),
+    sessionCookieOptions(isProduction()),
+  )
+  resetRateLimit(key)
+  logger.info('Login succeeded')
+  return { ok: true }
+}
 
-    // Calculate profit/loss
-    const { profit, profitPercent } = calculateTokenProfitLoss(
-      transactions, 
-      tokenBalance,
-      publicKey
+export async function logout(): Promise<void> {
+  cookies().delete(SESSION_COOKIE)
+}
+
+/** Whether the current request carries a valid session. Safe to call from a page. */
+export async function isAuthenticated(): Promise<boolean> {
+  const auth = readAuthConfig()
+  if (!auth.ok) return false
+  return verifySessionToken(cookies().get(SESSION_COOKIE)?.value, auth.secret).valid
+}
+
+/** Throws unless the caller holds a valid session. */
+function requireSession(): void {
+  const auth = readAuthConfig()
+  if (!auth.ok) {
+    throw new PublicError('Authentication is not configured on the server.')
+  }
+  const result = verifySessionToken(cookies().get(SESSION_COOKIE)?.value, auth.secret)
+  if (!result.valid) {
+    logger.warn('Rejected unauthenticated write action', { reason: result.reason })
+    throw new PublicError(
+      result.reason === 'expired' ? 'Your session expired. Sign in again.' : 'Not authorised.',
     )
-    logger.info('Profit/loss calculated', { profit, profitPercent })
-
-    const data: WalletData = {
-      balance: ethBalanceFormatted,
-      portfolioValue,
-      profit: profit.toFixed(2),
-      profitPercent,
-      tokenBalance,
-      transactions,
-      ethPrice
-    }
-
-    setCachedData(cacheKey, data)
-    logger.info('Wallet data cached and returned')
-    return data
-
-  } catch (error: any) {
-    logger.error('Error in getWalletBalance', { 
-      error: error.message,
-      code: error.code,
-      stack: error.stack 
-    })
-    throw new Error(`Failed to fetch wallet data: ${error.message}`)
   }
 }
 
-function calculateTokenProfitLoss(
-  transactions: Transaction[],
-  currentTokenBalance: string,
-  publicKey: string
-): { profit: number; profitPercent: number } {
-  logger.debug('Calculating token profit/loss...')
-  
-  const tokenTxs = transactions.filter(tx => tx.asset === 'TOKEN')
-  logger.debug('Token transactions filtered', { count: tokenTxs.length })
-  
-  if (tokenTxs.length === 0) {
-    logger.warn('No token transactions found')
-    return { profit: 0, profitPercent: 0 }
+/** Applies the transfer budget, keyed per client. */
+function requireTransferBudget(): void {
+  const limit = rateLimit(
+    `transfer:${clientKey(headers())}`,
+    LIMITS.transfer.limit,
+    LIMITS.transfer.windowMs,
+  )
+  if (!limit.allowed) {
+    const minutes = Math.max(1, Math.ceil((limit.resetAt - Date.now()) / 60000))
+    throw new PublicError(`Transfer limit reached. Try again in ${minutes} min.`)
   }
-
-  let totalIn = 0
-  let totalOut = 0
-
-  for (const tx of tokenTxs) {
-    const value = parseFloat(tx.tokenValue) || 0
-    if (tx.to.toLowerCase() === publicKey.toLowerCase()) {
-      totalIn += value
-    } else {
-      totalOut += value
-    }
-  }
-
-  const current = parseFloat(currentTokenBalance)
-  const invested = totalIn - totalOut
-  
-  logger.debug('Profit calculation', { totalIn, totalOut, invested, current })
-
-  if (invested <= 0) {
-    return { 
-      profit: current, 
-      profitPercent: invested < 0 ? 100 : 0 
-    }
-  }
-
-  const profit = current - invested
-  const profitPercent = (profit / invested) * 100
-
-  return { profit, profitPercent }
 }
 
-export async function getTransactionHistory(
-  publicKey: string, 
-  tokenDecimals: number = 6
-): Promise<Transaction[]> {
-  const cacheKey = `tx_${publicKey}_${process.env.NEXT_PUBLIC_CHAIN_ID}`
-  logger.info('getTransactionHistory called', { publicKey, cacheKey })
+// ─── Read path ───────────────────────────────────────────────────────────────
 
-  const cached = getCachedData<Transaction[]>(cacheKey)
-  if (cached) {
-    logger.info('Returning cached transactions')
-    return cached
+export type TokenMeta = { symbol: string; decimals: number }
+
+export type DashboardData = {
+  address: string
+  chainId: number
+  token: TokenMeta
+  /** Token balance, human-readable. */
+  tokenBalance: string
+  /** Native balance, human-readable. */
+  nativeBalance: string
+  transfers: Transfer[]
+  flows: ReturnType<typeof computeFlows>
+  performance: ReturnType<typeof computePerformance>
+  series: ReturnType<typeof buildBalanceSeries>
+  /** Non-fatal problems worth showing rather than hiding. */
+  warnings: string[]
+}
+
+async function readTokenAndBalances(
+  rpcUrl: string,
+  tokenAddress: string,
+  address: string,
+): Promise<{ token: TokenMeta; tokenBalance: string; nativeBalance: string }> {
+  const provider = new ethers.JsonRpcProvider(rpcUrl)
+  const contract = new ethers.Contract(tokenAddress, ERC20_ABI, provider)
+
+  const [nativeRaw, balanceRaw, decimalsRaw, symbolRaw] = await Promise.all([
+    provider.getBalance(address),
+    contract.balanceOf(address),
+    contract.decimals(),
+    contract.symbol(),
+  ])
+
+  const decimals = Number(decimalsRaw)
+  return {
+    token: { symbol: String(symbolRaw), decimals },
+    tokenBalance: fromBaseUnits(balanceRaw, decimals),
+    nativeBalance: ethers.formatEther(nativeRaw),
   }
+}
 
-  if (!process.env.ETHERSCAN_API_KEY || process.env.ETHERSCAN_API_KEY.includes('your')) {
-    logger.error('ETHERSCAN_API_KEY not configured')
-    return []
+/**
+ * Everything the dashboard renders, for any address.
+ *
+ * A failure to read the chain is fatal (there is nothing to show); a failure to
+ * read history is reported as a warning, because the balance is still true and
+ * worth displaying. What never happens is substituting invented data.
+ */
+export async function getDashboardData(
+  addressInput?: string,
+  period: Period = '1M',
+): Promise<DashboardData> {
+  const limit = rateLimit(`read:${clientKey(headers())}`, LIMITS.read.limit, LIMITS.read.windowMs)
+  if (!limit.allowed) throw new PublicError('Too many requests. Slow down for a moment.')
+
+  const cfg = readConfig()
+  if (!cfg.ok) {
+    throw new PublicError(
+      `Server is not configured: ${[...cfg.missing, ...cfg.invalid].join(', ')}`,
+    )
   }
+  const { config } = cfg
 
+  const address = normalizeAddress(addressInput ?? config.watchAddress)
+  if (!address) throw new PublicError('That is not a valid Ethereum address.')
+
+  const warnings: string[] = []
+
+  let chain: Awaited<ReturnType<typeof readTokenAndBalances>>
   try {
-    const network = process.env.NEXT_PUBLIC_CHAIN_ID === '5' ? 'goerli' : 'api'
-    const baseUrl = network === 'goerli' 
-      ? 'https://api-goerli.etherscan.io' 
-      : 'https://api.etherscan.io'
+    chain = await readTokenAndBalances(config.rpcUrl, config.tokenAddress, address)
+  } catch (error) {
+    logger.error('Chain read failed', error)
+    throw new PublicError('Could not reach the network. Check the RPC endpoint and try again.')
+  }
 
-    logger.info('Fetching from Etherscan', { network, baseUrl })
-
-    const [txResponse, tokenTxResponse] = await Promise.all([
-      axios.get(`${baseUrl}/api`, {
-        params: {
-          module: 'account',
-          action: 'txlist',
-          address: publicKey,
-          startblock: 0,
-          endblock: 99999999,
-          sort: 'desc',
-          apikey: process.env.ETHERSCAN_API_KEY
-        },
-        timeout: 10000
-      }),
-      axios.get(`${baseUrl}/api`, {
-        params: {
-          module: 'account',
-          action: 'tokentx',
-          address: publicKey,
-          contractaddress: process.env.TOKEN_CONTRACT_ADDRESS,
-          startblock: 0,
-          endblock: 99999999,
-          sort: 'desc',
-          apikey: process.env.ETHERSCAN_API_KEY
-        },
-        timeout: 10000
-      })
+  let transfers: Transfer[] = []
+  try {
+    const options = { apiKey: config.etherscanApiKey, chainId: config.chainId }
+    const [nativeRaw, tokenRaw] = await Promise.all([
+      fetchEthTransactions(options, address),
+      fetchTokenTransactions(options, address, config.tokenAddress),
     ])
 
-    logger.debug('Etherscan responses received', {
-      ethTxStatus: txResponse.data.status,
-      tokenTxStatus: tokenTxResponse.data.status,
-      ethTxCount: txResponse.data.result?.length,
-      tokenTxCount: tokenTxResponse.data.result?.length
-    })
+    transfers = sortTransfers(
+      [
+        ...nativeRaw.map(r => normalizeTransfer(r, address, 'NATIVE', 18, 'ETH')),
+        ...tokenRaw.map(r =>
+          normalizeTransfer(r, address, 'TOKEN', chain.token.decimals, chain.token.symbol),
+        ),
+      ].filter((t): t is Transfer => t !== null),
+    )
+  } catch (error) {
+    logger.error('History read failed', error)
+    warnings.push(
+      error instanceof EtherscanError && error.kind === 'config'
+        ? 'Transaction history is unavailable: the Etherscan API key is missing or rejected.'
+        : 'Transaction history is temporarily unavailable. Balances below are still live.',
+    )
+  }
 
-    const transactions: Transaction[] = []
+  const balanceNumber = Number(chain.tokenBalance)
+  const flows = computeFlows(transfers, 'TOKEN')
+  const performance = computePerformance(balanceNumber, flows)
+  const series = buildBalanceSeries(transfers, balanceNumber, period)
 
-    // ETH transactions
-    if (txResponse.data.status === '1' && Array.isArray(txResponse.data.result)) {
-      transactions.push(...txResponse.data.result.slice(0, 10).map((tx: any) => ({
-        hash: tx.hash,
-        from: tx.from,
-        to: tx.to,
-        value: ethers.formatEther(tx.value),
-        timestamp: parseInt(tx.timeStamp) * 1000,
-        type: tx.to.toLowerCase() === publicKey.toLowerCase() ? 'deposit' : 'withdraw',
-        tokenValue: '0',
-        asset: 'ETH' as const
-      })))
-      logger.info('ETH transactions processed', { count: Math.min(txResponse.data.result.length, 10) })
-    } else {
-      logger.warn('No ETH transactions or error', { message: txResponse.data.message })
-    }
-
-    // Token transactions
-    if (tokenTxResponse.data.status === '1' && Array.isArray(tokenTxResponse.data.result)) {
-      const tokenTxs = tokenTxResponse.data.result.slice(0, 20).map((tx: any) => ({
-        hash: tx.hash,
-        from: tx.from,
-        to: tx.to,
-        value: '0',
-        timestamp: parseInt(tx.timeStamp) * 1000,
-        type: tx.to.toLowerCase() === publicKey.toLowerCase() ? 'deposit' : 'withdraw',
-        tokenValue: ethers.formatUnits(tx.value, tx.tokenDecimal || tokenDecimals),
-        asset: 'TOKEN' as const
-      }))
-      transactions.push(...tokenTxs)
-      logger.info('Token transactions processed', { count: Math.min(tokenTxResponse.data.result.length, 20) })
-    } else {
-      logger.warn('No token transactions or error', { message: tokenTxResponse.data.message })
-    }
-
-    transactions.sort((a, b) => b.timestamp - a.timestamp)
-
-    setCachedData(cacheKey, transactions.slice(0, 30))
-    logger.info('Transactions cached and returned', { totalCount: transactions.length })
-    return transactions.slice(0, 30)
-
-  } catch (error: any) {
-    logger.error('Error fetching transactions', {
-      error: error.message,
-      response: error.response?.data,
-      status: error.response?.status
-    })
-    return []
+  return {
+    address,
+    chainId: config.chainId,
+    token: chain.token,
+    tokenBalance: chain.tokenBalance,
+    nativeBalance: chain.nativeBalance,
+    transfers,
+    flows,
+    performance,
+    series,
+    warnings,
   }
 }
 
-export async function getChartData(
-  publicKey: string,
-  period: '1H' | '6H' | '1D' | '1W' | '1M' | 'All'
-): Promise<ChartDataPoint[]> {
-  const cacheKey = `chart_${publicKey}_${period}_${process.env.NEXT_PUBLIC_CHAIN_ID}`
-  logger.info('getChartData called', { publicKey, period, cacheKey })
+/** Recompute only the balance series, for the period switcher. */
+export async function getSeries(
+  addressInput: string,
+  period: Period,
+): Promise<ReturnType<typeof buildBalanceSeries>> {
+  const data = await getDashboardData(addressInput, period)
+  return data.series
+}
 
-  const cached = getCachedData<ChartDataPoint[]>(cacheKey)
-  if (cached) {
-    logger.info('Returning cached chart data')
-    return cached
+// ─── Write path ──────────────────────────────────────────────────────────────
+
+export type TransferResult =
+  | { ok: true; txHash: string }
+  | { ok: false; error: string }
+
+type SignerBundle = {
+  wallet: ethers.Wallet
+  contract: ethers.Contract
+  decimals: number
+  symbol: string
+}
+
+async function getSigner(): Promise<SignerBundle> {
+  const cfg = readConfig()
+  if (!cfg.ok) throw new PublicError('Server is not configured.')
+
+  const privateKey = process.env.WALLET_PRIVATE_KEY
+  if (!privateKey || privateKey.includes('your')) {
+    throw new PublicError('Transfers are disabled: no signing key is configured.')
   }
 
+  const provider = new ethers.JsonRpcProvider(cfg.config.rpcUrl)
+  const wallet = new ethers.Wallet(privateKey, provider)
+  const contract = new ethers.Contract(cfg.config.tokenAddress, ERC20_ABI, wallet)
+
+  // Decimals come from the contract, never from a constant: hardcoding 6 against
+  // an 18-decimal token scales every transfer by a factor of a trillion.
+  const [decimalsRaw, symbolRaw] = await Promise.all([contract.decimals(), contract.symbol()])
+
+  return {
+    wallet,
+    contract,
+    decimals: Number(decimalsRaw),
+    symbol: String(symbolRaw),
+  }
+}
+
+async function submitTransfer(
+  bundle: SignerBundle,
+  to: string,
+  amount: string,
+): Promise<TransferResult> {
+  const units = toBaseUnits(amount, bundle.decimals)
+
+  const balance: bigint = await bundle.contract.balanceOf(bundle.wallet.address)
+  if (balance < units) {
+    return {
+      ok: false,
+      error: `Insufficient balance: ${fromBaseUnits(balance, bundle.decimals)} ${bundle.symbol} available.`,
+    }
+  }
+
+  const tx = await bundle.contract.transfer(to, units)
+  logger.info('Transfer submitted', { hash: tx.hash })
+
+  const receipt = await tx.wait(1)
+  if (!receipt || receipt.status !== 1) {
+    return { ok: false, error: 'The transaction was reverted on-chain.' }
+  }
+
+  return { ok: true, txHash: tx.hash }
+}
+
+/**
+ * Move tokens from the signing wallet into the watched address.
+ * Requires a session; rate limited.
+ */
+export async function depositFunds(amount: string): Promise<TransferResult> {
   try {
-    const transactions = await getTransactionHistory(publicKey)
-    const tokenTxs = transactions.filter(tx => tx.asset === 'TOKEN')
-    
-    logger.debug('Chart data generation', { 
-      totalTxs: transactions.length,
-      tokenTxs: tokenTxs.length 
-    })
-    
-    if (tokenTxs.length === 0) {
-      logger.warn('No token transactions for chart, generating empty')
-      return generateEmptyChart(period)
+    requireSession()
+    requireTransferBudget()
+
+    const cfg = readConfig()
+    if (!cfg.ok) throw new PublicError('Server is not configured.')
+
+    const bundle = await getSigner()
+    return await submitTransfer(bundle, cfg.config.watchAddress, amount)
+  } catch (error) {
+    if (error instanceof AmountError) return { ok: false, error: error.message }
+    logger.error('Deposit failed', error)
+    return { ok: false, error: publicErrorMessage(error, 'The transfer could not be completed.') }
+  }
+}
+
+/**
+ * Move tokens from the signing wallet to an external address.
+ *
+ * Requires a session, is rate limited, and — the control that actually bounds the
+ * damage — refuses any destination that is not on WITHDRAW_ALLOWLIST. An empty
+ * allowlist disables withdrawals entirely rather than allowing everything.
+ */
+export async function withdrawFunds(toAddress: string, amount: string): Promise<TransferResult> {
+  try {
+    requireSession()
+    requireTransferBudget()
+
+    const cfg = readConfig()
+    if (!cfg.ok) throw new PublicError('Server is not configured.')
+
+    if (!isValidAddress(toAddress)) {
+      return { ok: false, error: 'That is not a valid Ethereum address.' }
     }
+    const to = normalizeAddress(toAddress) as string
 
-    const now = Date.now()
-    const ranges: Record<string, number> = {
-      '1H': 60 * 60 * 1000,
-      '6H': 6 * 60 * 60 * 1000,
-      '1D': 24 * 60 * 60 * 1000,
-      '1W': 7 * 24 * 60 * 60 * 1000,
-      '1M': 30 * 24 * 60 * 60 * 1000,
-      'All': 365 * 24 * 60 * 60 * 1000
-    }
-
-    const timeRange = ranges[period] || ranges['1D']
-    const intervals = period === '1H' ? 12 : period === '6H' ? 24 : period === '1D' ? 48 : 50
-    
-    logger.debug('Generating chart points', { intervals, timeRange })
-
-    const points: ChartDataPoint[] = []
-    
-    for (let i = intervals; i >= 0; i--) {
-      const timestamp = now - (i * timeRange / intervals)
-      let runningBalance = 0
-      
-      for (const tx of tokenTxs) {
-        if (tx.timestamp <= timestamp) {
-          const value = parseFloat(tx.tokenValue) || 0
-          if (tx.type === 'deposit') {
-            runningBalance += value
-          } else {
-            runningBalance -= value
-          }
-        }
+    const allowlist = cfg.config.withdrawAllowlist
+    if (allowlist.length === 0) {
+      return {
+        ok: false,
+        error: 'Withdrawals are disabled: WITHDRAW_ALLOWLIST is empty.',
       }
-
-      points.push({
-        value: Math.max(0, runningBalance),
-        timestamp
-      })
+    }
+    if (!allowlist.some(entry => isSameAddress(entry, to))) {
+      logger.warn('Withdrawal to a non-allowlisted address refused')
+      return {
+        ok: false,
+        error: 'That address is not on the withdrawal allowlist.',
+      }
     }
 
-    setCachedData(cacheKey, points)
-    logger.info('Chart data generated and cached', { pointsCount: points.length })
-    return points
+    const bundle = await getSigner()
+    if (isSameAddress(to, bundle.wallet.address)) {
+      return { ok: false, error: 'That is the signing wallet — the transfer would be a no-op.' }
+    }
 
-  } catch (error: any) {
-    logger.error('Error generating chart data', { error: error.message })
-    return generateEmptyChart(period)
+    return await submitTransfer(bundle, to, amount)
+  } catch (error) {
+    if (error instanceof AmountError) return { ok: false, error: error.message }
+    logger.error('Withdrawal failed', error)
+    return { ok: false, error: publicErrorMessage(error, 'The transfer could not be completed.') }
   }
 }
 
-function generateEmptyChart(period: string): ChartDataPoint[] {
-  logger.warn('Generating empty chart', { period })
-  
-  const now = Date.now()
-  const ranges: Record<string, number> = {
-    '1H': 60 * 60 * 1000,
-    '6H': 6 * 60 * 60 * 1000,
-    '1D': 24 * 60 * 60 * 1000,
-    '1W': 7 * 24 * 60 * 60 * 1000,
-    '1M': 30 * 24 * 60 * 60 * 1000,
-    'All': 365 * 24 * 60 * 60 * 1000
-  }
-  
-  const range = ranges[period] || ranges['1D']
-  const count = period === '1H' ? 12 : period === '6H' ? 24 : period === '1D' ? 48 : 50
-  
-  return Array.from({ length: count }, (_, i) => ({
-    value: 1000,
-    timestamp: now - (count - i) * (range / count)
-  }))
-}
-
-export async function depositFunds(amount: string): Promise<{ success: boolean; txHash?: string; error?: string }> {
-  logger.info('depositFunds called', { amount })
-
-  if (!process.env.WALLET_PRIVATE_KEY || process.env.WALLET_PRIVATE_KEY.includes('your')) {
-    logger.error('WALLET_PRIVATE_KEY not configured')
-    return { success: false, error: 'Wallet private key not configured' }
-  }
-
-  if (!process.env.NEXT_PUBLIC_WALLET_ADDRESS) {
-    logger.error('NEXT_PUBLIC_WALLET_ADDRESS not configured')
-    return { success: false, error: 'Wallet address not configured' }
-  }
-
-  try {
-    logger.info('Initializing deposit transaction...')
-    const provider = new ethers.JsonRpcProvider(process.env.RPC_URL)
-    const wallet = new ethers.Wallet(process.env.WALLET_PRIVATE_KEY, provider)
-    
-    logger.debug('Wallet address', { address: wallet.address })
-    
-    const tokenContract = getTokenContract(wallet)
-    
-    const amountInUnits = ethers.parseUnits(amount, 6)
-    logger.info('Sending deposit transaction', { 
-      to: process.env.NEXT_PUBLIC_WALLET_ADDRESS,
-      amount: amount,
-      amountInUnits: amountInUnits.toString()
-    })
-    
-    const tx = await tokenContract.transfer(process.env.NEXT_PUBLIC_WALLET_ADDRESS, amountInUnits)
-    logger.info('Transaction sent', { hash: tx.hash })
-    
-    const receipt = await Promise.race([
-      tx.wait(),
-      new Promise<never>((_, reject) => 
-        setTimeout(() => reject(new Error('Transaction timeout')), 60000)
-      )
-    ])
-
-    logger.info('Transaction confirmed', { 
-      status: receipt.status,
-      blockNumber: receipt.blockNumber 
-    })
-
-    if (receipt.status !== 1) {
-      throw new Error('Transaction failed on-chain')
-    }
-
-    cache.delete(`balance_${process.env.NEXT_PUBLIC_WALLET_ADDRESS}_${process.env.NEXT_PUBLIC_CHAIN_ID}`)
-    logger.info('Cache cleared after deposit')
-    
-    return { success: true, txHash: tx.hash }
-
-  } catch (error: any) {
-    logger.error('Deposit failed', { 
-      error: error.message,
-      code: error.code,
-      reason: error.reason 
-    })
-    return { success: false, error: error.message || 'Transaction failed' }
-  }
-}
-
-export async function withdrawFunds(
-  toAddress: string,
-  amount: string
-): Promise<{ success: boolean; txHash?: string; error?: string }> {
-  logger.info('withdrawFunds called', { toAddress, amount })
-
-  if (!toAddress || !toAddress.startsWith('0x') || toAddress.length !== 42) {
-    logger.error('Invalid recipient address', { toAddress, length: toAddress?.length })
-    return { success: false, error: 'Invalid recipient address' }
-  }
-
-  if (!process.env.WALLET_PRIVATE_KEY || process.env.WALLET_PRIVATE_KEY.includes('your')) {
-    logger.error('WALLET_PRIVATE_KEY not configured')
-    return { success: false, error: 'Wallet private key not configured' }
-  }
-
-  try {
-    logger.info('Initializing withdraw transaction...')
-    const provider = new ethers.JsonRpcProvider(process.env.RPC_URL)
-    const wallet = new ethers.Wallet(process.env.WALLET_PRIVATE_KEY, provider)
-    
-    logger.debug('Wallet address', { address: wallet.address })
-    
-    const tokenContract = getTokenContract(wallet)
-    
-    logger.debug('Checking balance...')
-    const balance = await tokenContract.balanceOf(wallet.address)
-    const amountInUnits = ethers.parseUnits(amount, 6)
-    
-    logger.info('Balance check', { 
-      balance: balance.toString(),
-      requested: amountInUnits.toString() 
-    })
-    
-    if (balance < amountInUnits) {
-      logger.error('Insufficient balance')
-      return { success: false, error: 'Insufficient balance' }
-    }
-    
-    logger.info('Sending withdraw transaction', { to: toAddress, amount })
-    const tx = await tokenContract.transfer(toAddress, amountInUnits)
-    logger.info('Transaction sent', { hash: tx.hash })
-    
-    const receipt = await Promise.race([
-      tx.wait(),
-      new Promise<never>((_, reject) => 
-        setTimeout(() => reject(new Error('Transaction timeout')), 60000)
-      )
-    ])
-
-    logger.info('Transaction confirmed', { 
-      status: receipt.status,
-      blockNumber: receipt.blockNumber 
-    })
-
-    if (receipt.status !== 1) {
-      throw new Error('Transaction failed on-chain')
-    }
-
-    cache.delete(`balance_${wallet.address}_${process.env.NEXT_PUBLIC_CHAIN_ID}`)
-    cache.delete(`balance_${toAddress}_${process.env.NEXT_PUBLIC_CHAIN_ID}`)
-    logger.info('Cache cleared after withdraw')
-    
-    return { success: true, txHash: tx.hash }
-
-  } catch (error: any) {
-    logger.error('Withdraw failed', { 
-      error: error.message,
-      code: error.code,
-      reason: error.reason 
-    })
-    return { success: false, error: error.message || 'Transaction failed' }
-  }
-}
-
-export async function getProfitLoss(publicKey: string): Promise<ProfitLossData> {
-  const cacheKey = `profit_${publicKey}_${process.env.NEXT_PUBLIC_CHAIN_ID}`
-  logger.info('getProfitLoss called', { publicKey, cacheKey })
-
-  const cached = getCachedData<ProfitLossData>(cacheKey)
-  if (cached) {
-    logger.info('Returning cached profit/loss')
-    return cached
-  }
-
-  try {
-    logger.debug('Fetching wallet balance and chart data...')
-    const walletData = await getWalletBalance(publicKey)
-    const chartData = await getChartData(publicKey, '1D')
-
-    const result: ProfitLossData = {
-      profit: parseFloat(walletData.profit),
-      profitPercent: walletData.profitPercent,
-      chartData
-    }
-
-    setCachedData(cacheKey, result)
-    logger.info('Profit/loss calculated and cached', result)
-    return result
-
-  } catch (error: any) {
-    logger.error('Error in getProfitLoss', { error: error.message })
-    throw new Error('Failed to calculate profit/loss')
+/** What the UI needs to know about the write path without exposing configuration. */
+export async function getTransferCapability(): Promise<{
+  authenticated: boolean
+  signingConfigured: boolean
+  withdrawalTargets: string[]
+}> {
+  const cfg = readConfig()
+  return {
+    authenticated: await isAuthenticated(),
+    signingConfigured: cfg.ok ? cfg.config.hasPrivateKey : false,
+    withdrawalTargets: cfg.ok ? cfg.config.withdrawAllowlist : [],
   }
 }

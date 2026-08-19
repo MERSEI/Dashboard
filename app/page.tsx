@@ -1,71 +1,93 @@
-import React, { Suspense } from "react";
-import { getWalletBalance, getProfitLoss } from "./actions";
-import DashboardClient from "@/components/DashboardClient";
+import React from 'react'
+import { getDashboardData, getTransferCapability } from './actions'
+import DashboardClient from '@/components/DashboardClient'
+import { readConfig } from '@/lib/config'
 
-async function getDashboardData() {
-  const publicKey = process.env.NEXT_PUBLIC_WALLET_ADDRESS;
+/**
+ * Balances must never be baked in at build time.
+ *
+ * Next.js prerendered this route as static, so the figures were frozen at whatever
+ * the build saw — and when the environment was missing, the *error* page was the
+ * thing that got cached, so fixing the variable did not fix the page.
+ */
+export const dynamic = 'force-dynamic'
 
-  if (!publicKey || publicKey.includes("your")) {
-    throw new Error("NEXT_PUBLIC_WALLET_ADDRESS not configured in .env.local");
-  }
-
-  const [walletData, profitData] = await Promise.all([
-    getWalletBalance(publicKey),
-    getProfitLoss(publicKey),
-  ]);
-
-  return {
-    balance: parseFloat(walletData.tokenBalance),
-    profit: profitData.profit,
-    profitPercent: profitData.profitPercent,
-    portfolioValue: parseFloat(walletData.portfolioValue),
-    usdcValue: parseFloat(walletData.tokenBalance),
-    chartData: profitData.chartData,
-    publicKey,
-  };
+function ConfigNotice({ missing, invalid }: { missing: string[]; invalid: string[] }) {
+  return (
+    <main className="grid min-h-screen place-items-center p-6">
+      <div className="panel max-w-md">
+        <div className="panel-head">
+          <span className="label">Setup required</span>
+          <span className="chip">Not configured</span>
+        </div>
+        <div className="flex flex-col gap-3 p-5">
+          <h1 className="title">Almost there</h1>
+          <p className="meta">
+            Copy <code className="mark">.env.example</code> to{' '}
+            <code className="mark">.env.local</code> and fill in the values below.
+          </p>
+          {missing.length > 0 && (
+            <div>
+              <span className="label">Missing</span>
+              <ul className="mt-1 flex flex-col gap-1">
+                {missing.map(key => (
+                  <li key={key} className="num text-[0.78rem]">
+                    {key}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {invalid.length > 0 && (
+            <div>
+              <span className="label">Invalid</span>
+              <ul className="mt-1 flex flex-col gap-1">
+                {invalid.map(key => (
+                  <li key={key} className="num text-[0.78rem]">
+                    {key}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      </div>
+    </main>
+  )
 }
 
-function LoadingSkeleton() {
+function LoadError({ message }: { message: string }) {
   return (
-    <div className="min-h-screen bg-[#c2410c] flex items-center justify-center">
-      <div className="flex flex-col md:flex-row gap-[19px]">
-        <div
-          className="bg-white shadow-lg animate-pulse"
-          style={{ width: "639px", height: "236px", borderRadius: "8px" }}
-        />
-        <div
-          className="bg-white shadow-lg animate-pulse"
-          style={{ width: "639px", height: "236px", borderRadius: "8px" }}
-        />
+    <main className="grid min-h-screen place-items-center p-6">
+      <div className="panel max-w-md">
+        <div className="panel-head">
+          <span className="label">Could not load</span>
+        </div>
+        <div className="flex flex-col gap-3 p-5">
+          <h1 className="title">Nothing to show yet</h1>
+          <p className="meta">{message}</p>
+        </div>
       </div>
-    </div>
-  );
+    </main>
+  )
 }
 
 export default async function HomePage() {
-  let data;
+  const cfg = readConfig()
+  if (!cfg.ok) return <ConfigNotice missing={cfg.missing} invalid={cfg.invalid} />
 
   try {
-    data = await getDashboardData();
-  } catch (error: any) {
+    const [data, capability] = await Promise.all([
+      getDashboardData(undefined, '1M'),
+      getTransferCapability(),
+    ])
     return (
-      <div className="min-h-screen bg-[#c2410c] flex items-center justify-center p-8">
-        <div className="bg-white rounded-lg p-8 max-w-md text-center">
-          <h1 className="text-xl font-bold text-red-600 mb-4">
-            Configuration Error
-          </h1>
-          <p className="text-gray-600 mb-4">{error.message}</p>
-          <p className="text-sm text-gray-500">
-            Please configure your .env.local file with valid API keys.
-          </p>
-        </div>
-      </div>
-    );
+      <main>
+        <DashboardClient initial={data} capability={capability} />
+      </main>
+    )
+  } catch (error) {
+    // publicErrorMessage has already stripped anything infrastructure-specific.
+    return <LoadError message={(error as Error).message} />
   }
-
-  return (
-    <Suspense fallback={<LoadingSkeleton />}>
-      <DashboardClient {...data} />
-    </Suspense>
-  );
 }

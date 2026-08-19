@@ -1,22 +1,18 @@
-import type { Metadata } from "next";
-import { Inter } from "next/font/google";
-import "./globals.css";
-
-const inter = Inter({ subsets: ["latin"] });
+import type { Metadata } from 'next'
+import './globals.css'
 
 export const metadata: Metadata = {
-  title: "Crypto Wallet Dashboard",
-  description: "Manage your crypto portfolio",
-};
+  title: 'Wallet Analytics',
+  description:
+    'Read-only analytics for any Ethereum address: token balance, transfer flows and balance history.',
+}
 
-export default function RootLayout({
-  children,
-}: {
-  children: React.ReactNode;
-}) {
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en">
-      <body className={inter.className}>{children}</body>
+      {/* Fonts are self-hosted from /public/fonts via @font-face in globals.css —
+          no third-party font request, and one less origin to trust. */}
+      <body>{children}</body>
     </html>
-  );
+  )
 }
