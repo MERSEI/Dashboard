@@ -21,7 +21,10 @@ jobs:
           node-version: '22'
           cache: npm
 
-      - run: npm ci
+      # npm install, not ci: the wasm32-wasi fallbacks behind Tailwind and rolldown
+      # resolve to different versions per platform, so a lockfile written on Windows
+      # never satisfies `npm ci` on the Linux runner.
+      - run: npm install --no-audit --no-fund
 
       - name: Lint
         run: npm run lint
