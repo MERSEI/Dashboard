@@ -1,5 +1,7 @@
 # Wallet Analytics
 
+[![CI](https://github.com/MERSEI/Dashboard/actions/workflows/ci.yml/badge.svg)](https://github.com/MERSEI/Dashboard/actions/workflows/ci.yml)
+
 Read-only analytics for any Ethereum address — token balance, transfer flows and
 balance history — with an optional, gated transfer panel.
 
